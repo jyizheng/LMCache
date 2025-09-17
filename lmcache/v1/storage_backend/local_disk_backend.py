@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -13,7 +14,13 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    DiskCacheMetadata,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    TORCH_DTYPE_TO_STR_DTYPE,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -29,6 +36,32 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+_METADATA_SUFFIX = ".meta"
+_METADATA_VERSION = 1
+
+
+def _dtype_to_string(dtype: torch.dtype) -> str:
+    if dtype in TORCH_DTYPE_TO_STR_DTYPE:
+        return TORCH_DTYPE_TO_STR_DTYPE[dtype]
+    dtype_str = str(dtype)
+    if dtype_str.startswith("torch."):
+        dtype_str = dtype_str[len("torch.") :]
+    return dtype_str
+
+
+def _string_to_dtype(dtype_str: Optional[str]) -> Optional[torch.dtype]:
+    if dtype_str is None:
+        return None
+    if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
+        return STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
+    if dtype_str.startswith("torch."):
+        dtype_str = dtype_str[len("torch.") :]
+    try:
+        return getattr(torch, dtype_str)
+    except AttributeError:
+        logger.warning("Unsupported torch dtype string in metadata: %s", dtype_str)
+        return None
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -147,6 +180,22 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
 
+        # Disk persistence: repopulate in-memory index from disk if enabled
+        self.local_disk_persistence = bool(
+            getattr(config, "local_disk_persistence", False)
+        )
+        self.populate_disk_cache_to_cpu_on_start = bool(
+            getattr(config, "populate_disk_cache_to_cpu_on_start", True)
+        )
+        if self.local_disk_persistence:
+            disk_keys = self._restore_persistent_cache()
+            if (
+                self.populate_disk_cache_to_cpu_on_start
+                and self.use_local_cpu
+                and disk_keys
+            ):
+                self._prefetch_persisted_cache(disk_keys)
+
     def __str__(self):
         return "LocalDiskBackend"
 
@@ -155,6 +204,200 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
+
+    def _metadata_path(self, data_path: str) -> str:
+        return data_path + _METADATA_SUFFIX
+
+    def _write_metadata_file(self, metadata: DiskCacheMetadata) -> None:
+        if not self.local_disk_persistence:
+            return        
+        if metadata.shape is None or metadata.dtype is None:
+            raise ValueError("Metadata must contain shape and dtype to persist to disk")
+
+        fmt_name = metadata.fmt.name if metadata.fmt is not None else None
+        metadata_dict = {
+            "version": _METADATA_VERSION,
+            "size": int(metadata.size),
+            "shape": [int(dim) for dim in metadata.shape],
+            "dtype": _dtype_to_string(metadata.dtype),
+            "fmt": fmt_name,
+        }
+        meta_path = self._metadata_path(metadata.path)
+        tmp_path = meta_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(metadata_dict, f)
+        os.replace(tmp_path, meta_path)
+
+    def _read_metadata_from_disk(
+        self, data_path: str
+    ) -> Optional[tuple[int, torch.Size, torch.dtype, Optional[MemoryFormat]]]:
+        meta_path = self._metadata_path(data_path)
+        if not os.path.exists(meta_path):
+            logger.warning("Missing metadata file for persisted cache %s", data_path)
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read metadata file %s: %s", meta_path, exc)
+            return None
+
+        version = metadata.get("version")
+        if version != _METADATA_VERSION:
+            logger.warning(
+                "Unsupported metadata version %s for %s", version, meta_path
+            )
+            return None
+
+        shape_value = metadata.get("shape")
+        if not isinstance(shape_value, list):
+            logger.warning("Invalid shape metadata for %s: %s", data_path, shape_value)
+            return None
+        try:
+            shape = torch.Size([int(dim) for dim in shape_value])
+        except (TypeError, ValueError) as exc:
+            logger.warning("Failed to parse shape metadata for %s: %s", data_path, exc)
+            return None
+
+        dtype = _string_to_dtype(metadata.get("dtype"))
+        if dtype is None:
+            logger.warning("Invalid dtype metadata for %s", data_path)
+            return None
+
+        fmt_str = metadata.get("fmt")
+        fmt: Optional[MemoryFormat] = None
+        if fmt_str is not None:
+            try:
+                fmt = MemoryFormat[fmt_str]
+            except KeyError:
+                logger.warning(
+                    "Invalid memory format metadata for %s: %s", data_path, fmt_str
+                )
+                fmt = None
+
+        size = metadata.get("size")
+        if size is None:
+            try:
+                size_int = os.path.getsize(data_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to stat data file for %s when size missing: %s",
+                    data_path,
+                    exc,
+                )
+                size_int = 0
+        else:
+            try:
+                size_int = int(size)
+            except (TypeError, ValueError):
+                logger.warning("Invalid size metadata for %s: %s", data_path, size)
+                try:
+                    size_int = os.path.getsize(data_path)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to stat data file for %s when size invalid: %s",
+                        data_path,
+                        exc,
+                    )
+                    size_int = 0
+            else:
+                if size_int <= 0:
+                    try:
+                        size_int = os.path.getsize(data_path)
+                    except OSError as exc:
+                        logger.warning(
+                            "Failed to stat data file for %s when size non-positive: %s",
+                            data_path,
+                            exc,
+                        )
+                        size_int = 0
+
+        return size_int, shape, dtype, fmt
+
+    def _remove_metadata_file(self, data_path: str) -> None:
+        if not self.local_disk_persistence:
+            return
+        meta_path = self._metadata_path(data_path)
+        try:
+            os.remove(meta_path)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.warning("Failed to remove metadata file %s: %s", meta_path, e)
+
+    def _restore_persistent_cache(self) -> list[CacheEngineKey]:
+        logger.info(
+            "Local disk persistence enabled. Scanning for existing cache files..."
+        )
+        disk_keys: list[CacheEngineKey] = []
+        total_size = 0
+        for entry in sorted(os.listdir(self.path)):
+            if not entry.endswith(".pt"):
+                continue
+            data_path = os.path.join(self.path, entry)
+            if not os.path.isfile(data_path):
+                continue
+            key_str = entry[:-3].replace("-", "/")
+            try:
+                key = CacheEngineKey.from_string(key_str)
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to parse cache key from file %s: %s", entry, exc
+                )
+                continue
+
+            metadata = self._read_metadata_from_disk(data_path)
+            if metadata is None:
+                continue
+            size, shape, dtype, fmt = metadata
+            disk_meta = DiskCacheMetadata(data_path, size, shape, dtype, fmt, 0)
+            self.dict[key] = disk_meta
+            self.cache_policy.update_on_put(key)
+            disk_keys.append(key)
+            total_size += size
+
+        self.current_cache_size = float(total_size)
+        self.usage = total_size
+        self.stats_monitor.update_local_storage_usage(self.usage)
+        if total_size:
+            logger.info(
+                "Restored %d disk cache entries (%.2f MB) from %s.",
+                len(disk_keys),
+                total_size / 1e6,
+                self.path,
+            )
+        else:
+            logger.info("No existing disk cache entries found in %s.", self.path)
+
+        return disk_keys
+
+    def _prefetch_persisted_cache(self, keys: list[CacheEngineKey]) -> None:
+        logger.info(
+            "Prefetching %d disk cache entries to CPU memory...",
+            len(keys),
+        )
+        for key in keys:
+            memory_obj: Optional[MemoryObj] = None
+            try:
+                memory_obj = self.get_blocking(key)
+            except (IOError, FileNotFoundError) as exc:
+                logger.warning("Failed to prefetch cache for key %s: %s", key, exc)
+                continue
+
+            if memory_obj is None:
+                logger.warning("Persisted cache for key %s missing on disk", key)
+                continue
+
+            try:
+                self.local_cpu_backend.submit_put_task(key, memory_obj)
+            except (RuntimeError, MemoryError) as exc:
+                logger.warning(
+                    "Failed to populate CPU cache for persisted key %s: %s", key, exc
+                )
+            finally:
+                memory_obj.ref_count_down()
+
+        logger.info("Disk cache prefetch to CPU complete.")
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -212,8 +455,13 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
 
         path = meta.path
-        size = meta.size
-        self.usage -= size
+        size = int(meta.size)
+        if size <= 0:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+        self.usage = max(0, self.usage - size)
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # NOTE: The following code will cause deadlock
@@ -224,8 +472,10 @@ class LocalDiskBackend(StorageBackendInterface):
         # res.result()
 
         os.remove(path)
+        self._remove_metadata_file(path)
 
         if force:
+            self.current_cache_size = max(0.0, self.current_cache_size - size)
             self.cache_policy.update_on_force_evict(key)
             self.disk_lock.release()
 
@@ -248,13 +498,19 @@ class LocalDiskBackend(StorageBackendInterface):
         path = self._key_to_path(key)
 
         has_stored = False
+        metadata_entry = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
         with self.disk_lock:
             # Need to do reinsert to update cache recency
             if key in self.dict:
                 self.dict.pop(key)
                 has_stored = True
 
-            self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
+            self.dict[key] = metadata_entry
+
+        try:
+            self._write_metadata_file(metadata_entry)
+        except (ValueError, OSError) as exc:
+            logger.warning("Failed to persist metadata for key %s: %s", key, exc)
 
         # push kv admit msg
         if self.lmcache_worker is not None and not has_stored:
@@ -277,7 +533,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_worker.insert_put_task(key)
 
         # TODO(Jiayi): Fragmentation is not considered here.
-        required_size = memory_obj.get_physical_size()
+        required_size = memory_obj.get_size()
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
@@ -450,8 +706,8 @@ class LocalDiskBackend(StorageBackendInterface):
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
 
-        size = len(buffer)
-        self.usage += size
+        data_size = len(buffer)
+        self.usage += data_size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
@@ -461,13 +717,13 @@ class LocalDiskBackend(StorageBackendInterface):
         # `submit_put_task` above.
         # Ref count down better be before `insert_key` for testing
         # purposes (e.g., testing mem_leak).
-        size = memory_obj.get_physical_size()
+        stored_size = data_size
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt)
+        self.insert_key(key, stored_size, shape, dtype, fmt)
 
         self.disk_worker.remove_put_task(key)
 
