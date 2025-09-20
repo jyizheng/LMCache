@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 import asyncio
+import json
 import os
 import threading
 import time
@@ -13,7 +14,13 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    DiskCacheMetadata,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    TORCH_DTYPE_TO_STR_DTYPE,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -29,6 +36,9 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+
+_METADATA_FILE_SUFFIX = ".meta"
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -165,10 +175,16 @@ class LocalDiskBackend(StorageBackendInterface):
                     continue
                 fpath = os.path.join(self.path, fname)
                 fsize = os.path.getsize(fpath)
-                # Metadata: shape, dtype, fmt are unknown here, will be filled on first access
-                self.dict[key] = DiskCacheMetadata(fpath, fsize, None, None, None, 0)
+                shape, dtype, fmt = self._read_metadata_file(fpath)
+                if shape is None or dtype is None or fmt is None:
+                    logger.debug(
+                        "Metadata for %s is missing or incomplete; skipping CPU warmup",
+                        key,
+                    )
+                self.dict[key] = DiskCacheMetadata(fpath, fsize, shape, dtype, fmt, 0)
                 self.current_cache_size += fsize
-                disk_keys.append(key)
+                if shape is not None and dtype is not None and fmt is not None:
+                    disk_keys.append(key)
             logger.info(f"Restored {len(self.dict)} disk cache entries from {self.path}.")
 
             # Optionally prefetch disk cache to CPU
@@ -190,6 +206,88 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
+
+    def _metadata_file_path(self, data_path: str) -> str:
+        return data_path + _METADATA_FILE_SUFFIX
+
+    def _write_metadata_file(
+        self,
+        data_path: str,
+        shape: Optional[torch.Size],
+        dtype: Optional[torch.dtype],
+        fmt: Optional[MemoryFormat],
+    ) -> None:
+        meta_path = self._metadata_file_path(data_path)
+        metadata: dict[str, Optional[object]] = {
+            "shape": list(shape) if shape is not None else None,
+            "dtype": TORCH_DTYPE_TO_STR_DTYPE.get(dtype) if dtype is not None else None,
+            "fmt": fmt.name if fmt is not None else None,
+        }
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f)
+        except Exception as exc:  # pragma: no cover - log unexpected failure
+            logger.warning(
+                "Failed to write metadata file %s: %s", meta_path, exc
+            )
+
+    def _read_metadata_file(
+        self, data_path: str
+    ) -> Tuple[
+        Optional[torch.Size],
+        Optional[torch.dtype],
+        Optional[MemoryFormat],
+    ]:
+        meta_path = self._metadata_file_path(data_path)
+        if not os.path.exists(meta_path):
+            return None, None, None
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception as exc:  # pragma: no cover - log unexpected failure
+            logger.warning(
+                "Failed to read metadata file %s: %s", meta_path, exc
+            )
+            return None, None, None
+
+        shape_value = metadata.get("shape")
+        shape = torch.Size(shape_value) if isinstance(shape_value, list) else None
+
+        dtype_str = metadata.get("dtype")
+        dtype = (
+            STR_DTYPE_TO_TORCH_DTYPE.get(dtype_str)
+            if isinstance(dtype_str, str)
+            else None
+        )
+        if isinstance(dtype_str, str) and dtype is None:
+            logger.warning(
+                "Unknown dtype %s in metadata file %s", dtype_str, meta_path
+            )
+
+        fmt_str = metadata.get("fmt")
+        fmt: Optional[MemoryFormat]
+        if isinstance(fmt_str, str):
+            try:
+                fmt = MemoryFormat[fmt_str]
+            except KeyError:
+                logger.warning(
+                    "Unknown memory format %s in metadata file %s", fmt_str, meta_path
+                )
+                fmt = None
+        else:
+            fmt = None
+
+        return shape, dtype, fmt
+
+    def _remove_metadata_file(self, data_path: str) -> None:
+        meta_path = self._metadata_file_path(data_path)
+        try:
+            os.remove(meta_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:  # pragma: no cover - log unexpected failure
+            logger.warning("Failed to remove metadata file %s: %s", meta_path, exc)
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -260,6 +358,9 @@ class LocalDiskBackend(StorageBackendInterface):
 
         os.remove(path)
 
+        if self.local_disk_persistence:
+            self._remove_metadata_file(path)
+
         if force:
             self.cache_policy.update_on_force_evict(key)
             self.disk_lock.release()
@@ -290,6 +391,9 @@ class LocalDiskBackend(StorageBackendInterface):
                 has_stored = True
 
             self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
+
+        if self.local_disk_persistence:
+            self._write_metadata_file(path, shape, dtype, fmt)
 
         # push kv admit msg
         if self.lmcache_worker is not None and not has_stored:
