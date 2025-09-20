@@ -260,3 +260,93 @@ class TestLocalDiskBackend:
         )
         assert memory_obj is not None
         local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_no_metadata_files_when_persistence_disabled(
+        self, temp_disk_path, async_loop, local_cpu_backend
+    ):
+        """Ensure metadata files are not written when persistence is disabled."""
+
+        config = create_test_config(temp_disk_path)
+        config.local_disk_persistence = False
+        backend = LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda",
+        )
+
+        key = create_test_key(10)
+        memory_obj = create_test_memory_obj()
+        expected_shape = memory_obj.metadata.shape
+        expected_dtype = memory_obj.metadata.dtype
+        expected_fmt = memory_obj.metadata.fmt
+
+        backend.disk_worker.insert_put_task(key)
+        backend.async_save_bytes_to_disk(key, memory_obj)
+
+        data_path = backend._key_to_path(key)
+        meta_path = backend._metadata_file_path(data_path)
+
+        assert os.path.exists(data_path)
+        assert not os.path.exists(meta_path)
+
+        # Ensure metadata for the in-memory index is still populated.
+        disk_meta = backend.dict[key]
+        assert disk_meta.shape == expected_shape
+        assert disk_meta.dtype == expected_dtype
+        assert disk_meta.fmt == expected_fmt
+
+        backend.close()
+        local_cpu_backend.memory_allocator.close()
+
+    def test_metadata_restored_with_persistence_enabled(
+        self, temp_disk_path, async_loop, local_cpu_backend
+    ):
+        """Metadata should round-trip when disk persistence is enabled."""
+
+        config = create_test_config(temp_disk_path)
+        config.local_disk_persistence = True
+        config.populate_disk_cache_to_cpu_on_start = False
+        backend = LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda",
+        )
+
+        key = create_test_key(11)
+        memory_obj = create_test_memory_obj()
+        expected_shape = memory_obj.metadata.shape
+        expected_dtype = memory_obj.metadata.dtype
+        expected_fmt = memory_obj.metadata.fmt
+
+        backend.disk_worker.insert_put_task(key)
+        backend.async_save_bytes_to_disk(key, memory_obj)
+
+        data_path = backend._key_to_path(key)
+        meta_path = backend._metadata_file_path(data_path)
+
+        assert os.path.exists(data_path)
+        assert os.path.exists(meta_path)
+
+        backend.close()
+
+        # Create a fresh backend using the same disk path to validate restore.
+        reload_config = create_test_config(temp_disk_path)
+        reload_config.local_disk_persistence = True
+        reload_config.populate_disk_cache_to_cpu_on_start = False
+        backend_reloaded = LocalDiskBackend(
+            config=reload_config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda",
+        )
+
+        assert key in backend_reloaded.dict
+        disk_meta = backend_reloaded.dict[key]
+        assert disk_meta.shape == expected_shape
+        assert disk_meta.dtype == expected_dtype
+        assert disk_meta.fmt == expected_fmt
+
+        backend_reloaded.close()
+        local_cpu_backend.memory_allocator.close()
