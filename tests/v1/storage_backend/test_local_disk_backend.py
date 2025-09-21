@@ -133,12 +133,17 @@ def local_cpu_backend(memory_allocator):
 def local_disk_backend(temp_disk_path, async_loop, local_cpu_backend):
     """Create a LocalDiskBackend for testing."""
     config = create_test_config(temp_disk_path)
-    return LocalDiskBackend(
+    backend = LocalDiskBackend(
         config=config,
         loop=async_loop,
         local_cpu_backend=local_cpu_backend,
         dst_device="cuda",
     )
+
+    try:
+        yield backend
+    finally:
+        backend.close()
 
 
 class TestLocalDiskBackend:
